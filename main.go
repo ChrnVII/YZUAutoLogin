@@ -31,29 +31,34 @@ const (
 )
 
 type Config struct {
-	Version           int    `json:"version"`
-	Username          string `json:"username"`
-	PasswordEncrypted string `json:"password_encrypted"`
-	ProbeURL          string `json:"probe_url"`
-	PortalHost        string `json:"portal_host"`
-	ProbeExpectedText string `json:"probe_expected_text"`
-	IntervalSeconds   int    `json:"interval_seconds"`
-	WebPort           int    `json:"web_port"`
+	Version             int    `json:"version"`
+	Username            string `json:"username"`
+	PasswordEncrypted   string `json:"password_encrypted"`
+	Service             string `json:"service"`
+	ProbeURL            string `json:"probe_url"`
+	PortalHost          string `json:"portal_host"`
+	ProbeExpectedText   string `json:"probe_expected_text"`
+	ProbeExpectedStatus int    `json:"probe_expected_status"`
+	IntervalSeconds     int    `json:"interval_seconds"`
+	WebPort             int    `json:"web_port"`
 }
 
 type configUpdate struct {
-	Username          string `json:"username"`
-	Password          string `json:"password"`
-	ClearPassword     bool   `json:"clear_password"`
-	ProbeURL          string `json:"probe_url"`
-	PortalHost        string `json:"portal_host"`
-	ProbeExpectedText string `json:"probe_expected_text"`
-	IntervalSeconds   int    `json:"interval_seconds"`
+	Username            string `json:"username"`
+	Password            string `json:"password"`
+	ClearPassword       bool   `json:"clear_password"`
+	Service             string `json:"service"`
+	ProbeURL            string `json:"probe_url"`
+	PortalHost          string `json:"portal_host"`
+	ProbeExpectedText   string `json:"probe_expected_text"`
+	ProbeExpectedStatus int    `json:"probe_expected_status"`
+	IntervalSeconds     int    `json:"interval_seconds"`
 }
 
 func defaultConfig() Config {
 	return Config{
 		Version:           1,
+		Service:           defaultPortalService,
 		ProbeURL:          "http://www.msftconnecttest.com/connecttest.txt",
 		PortalHost:        "sso.yzu.edu.cn",
 		ProbeExpectedText: "Microsoft Connect Test",
@@ -86,13 +91,18 @@ func newConfigStore(path string) (*ConfigStore, error) {
 	if err := json.Unmarshal(data, &s.cfg); err != nil {
 		return nil, fmt.Errorf("配置文件格式无效: %w", err)
 	}
+	// A config written before the service selector existed carries no service
+	// field. Resolve it before validation so the file stays loadable, and keep
+	// the telecom behaviour every earlier build had.
+	s.cfg.Service = normalizeService(s.cfg.Service)
 	if err := validateConfig(s.cfg); err != nil {
 		return nil, err
 	}
-	// Old builds stored a DPAPI field. It is intentionally discarded once the
-	// local-key encryption scheme is selected; save a normalized config now.
+	// Old builds stored a DPAPI field, and builds before the service selector
+	// wrote no service field at all. Both are normalized on load; save the
+	// normalized form so the file on disk matches what the WebUI shows.
 	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(data, &raw); err == nil && raw["password_dpapi"] != nil {
+	if err := json.Unmarshal(data, &raw); err == nil && (raw["password_dpapi"] != nil || raw["service"] == nil) {
 		if err := s.saveLocked(); err != nil {
 			return nil, fmt.Errorf("迁移配置失败: %w", err)
 		}
@@ -111,8 +121,14 @@ func validateConfig(cfg Config) error {
 	if cfg.PortalHost == "" || strings.Contains(cfg.PortalHost, "/") {
 		return errors.New("门户主机名无效")
 	}
+	if !isPortalService(cfg.Service) {
+		return fmt.Errorf("运营商服务无效，可选值为 %s", strings.Join(portalServices, "、"))
+	}
 	if len(cfg.ProbeExpectedText) > 512 {
 		return errors.New("预期探测正文不能超过 512 个字符")
+	}
+	if cfg.ProbeExpectedStatus != 0 && (cfg.ProbeExpectedStatus < 100 || cfg.ProbeExpectedStatus > 599) {
+		return errors.New("预期状态码必须是 100 到 599 之间的数字，留空或 0 表示不校验")
 	}
 	if cfg.IntervalSeconds < 15 || cfg.IntervalSeconds > 86400 {
 		return errors.New("探测间隔必须在 15 到 86400 秒之间")
@@ -135,9 +151,13 @@ func (s *ConfigStore) update(update configUpdate) error {
 
 	cfg := s.cfg
 	cfg.Username = strings.TrimSpace(update.Username)
-	cfg.ProbeURL = strings.TrimSpace(update.ProbeURL)
 	cfg.PortalHost = strings.TrimSpace(update.PortalHost)
+	// An unknown or blank selection falls back to the default service instead of
+	// silently failing the next login.
+	cfg.Service = normalizeService(update.Service)
+	cfg.ProbeURL = strings.TrimSpace(update.ProbeURL)
 	cfg.ProbeExpectedText = strings.TrimSpace(update.ProbeExpectedText)
+	cfg.ProbeExpectedStatus = update.ProbeExpectedStatus
 	cfg.IntervalSeconds = update.IntervalSeconds
 	if update.ClearPassword {
 		cfg.PasswordEncrypted = ""
@@ -407,14 +427,23 @@ func portalEntryURL(u *url.URL, cfg Config) string {
 	return ""
 }
 
+// probe checks the connectivity probe configured in the WebUI.
 func probe(ctx context.Context, cfg Config) (probeResult, error) {
+	return probeTargetURL(ctx, cfg, configuredProbeTarget(cfg))
+}
+
+// probeTargetURL checks one candidate address. Splitting the target out lets the
+// same detection rules serve the configured probe, the default gateway and the
+// IP-literal fallbacks, which differ only in their expected body, status and
+// timeout.
+func probeTargetURL(ctx context.Context, cfg Config, target probeTarget) (probeResult, error) {
 	client := &http.Client{
-		Timeout: 12 * time.Second,
+		Timeout: target.timeout,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
-	current, err := url.Parse(cfg.ProbeURL)
+	current, err := url.Parse(target.url)
 	if err != nil {
 		return probeResult{}, err
 	}
@@ -442,8 +471,9 @@ func probe(ctx context.Context, cfg Config) (probeResult, error) {
 			}
 		}
 		bodyText := string(body)
-		unexpectedResponse := cfg.ProbeExpectedText != "" && (resp.StatusCode != http.StatusOK || strings.TrimSpace(bodyText) != cfg.ProbeExpectedText)
-		if strings.Contains(strings.ToLower(bodyText), strings.ToLower(cfg.PortalHost)) || unexpectedResponse {
+		unexpectedStatus := target.expectedStatus != 0 && resp.StatusCode != target.expectedStatus
+		unexpectedResponse := target.expectedText != "" && (resp.StatusCode != http.StatusOK || strings.TrimSpace(bodyText) != target.expectedText)
+		if unexpectedStatus || unexpectedResponse || strings.Contains(strings.ToLower(bodyText), strings.ToLower(cfg.PortalHost)) {
 			if entryURL := findPortalEntryURL(bodyText); entryURL != "" {
 				return probeResult{portalURL: entryURL, captive: true}, nil
 			}
@@ -466,6 +496,9 @@ type Monitor struct {
 	mu       sync.Mutex
 	cancel   context.CancelFunc
 	checking sync.Mutex
+	// dhcp throttles the destructive lease restart so a short probe interval
+	// cannot drop the adapter repeatedly while a restart is still converging.
+	dhcp dhcpGate
 }
 
 func (m *Monitor) Start() {
@@ -508,41 +541,121 @@ func (m *Monitor) loop(ctx context.Context) {
 	}
 }
 
+// check runs one full probe cycle: discover the portal, sign in when one is
+// found, and fall back to network recovery when nothing can be reached at all.
 func (m *Monitor) check(ctx context.Context) {
-	m.checking.Lock()
+	// A recovery pass can take minutes, so a cycle that is still running absorbs
+	// the next tick instead of queueing a second pass behind it.
+	if !m.checking.TryLock() {
+		return
+	}
 	defer m.checking.Unlock()
+
 	cfg := m.configs.snapshot()
 	m.statuses.set(Status{State: "checking", Message: "正在探测网络…", LastChecked: time.Now()})
-	result, err := probe(ctx, cfg)
-	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		m.logger.Printf("探测失败: %v", err)
-		m.statuses.set(Status{State: "offline", Message: "探测失败：" + err.Error(), LastChecked: time.Now()})
+	found := discoverPortal(ctx, cfg)
+	if ctx.Err() != nil {
 		return
 	}
-	if !result.captive {
-		m.logger.Printf("网络正常")
-		m.statuses.set(Status{State: "online", Message: "网络正常", LastChecked: time.Now()})
+
+	if found.online {
+		m.reportOnline(cfg, found)
 		return
 	}
-	if result.portalURL == "" {
+	if found.portalURL != "" {
+		m.performLogin(ctx, cfg, found.portalURL)
+		return
+	}
+	if len(found.failures) == 0 {
 		m.logger.Printf("检测到门户拦截，但未能从重定向中发现登录地址；将在下个探测周期重试")
 		m.statuses.set(Status{State: "portal_discovery_failed", Message: "检测到门户拦截，正在等待发现登录地址", LastChecked: time.Now()})
 		return
 	}
 
-	m.logger.Printf("检测到校园网门户: %s", result.portalURL)
-	m.statuses.set(Status{State: "logging_in", Message: "检测到门户，正在登录…", LastChecked: time.Now(), PortalURL: result.portalURL})
+	m.logger.Printf("探测失败：%s", found.failureSummary())
+	recovered := m.recoverNetwork(ctx, cfg, found)
+	if ctx.Err() != nil {
+		return
+	}
+	switch {
+	case recovered.online:
+		m.logger.Printf("网络已恢复")
+		m.statuses.set(Status{State: "online", Message: "网络已恢复", LastChecked: time.Now()})
+	case recovered.portalURL != "":
+		m.performLogin(ctx, cfg, recovered.portalURL)
+	default:
+		m.statuses.set(Status{State: "offline", Message: "探测失败：" + found.failureKinds(), LastChecked: time.Now()})
+	}
+}
+
+// reportOnline records a healthy cycle. A healthy result that only an IP literal
+// could produce still means the resolver is broken, so that case is named in the
+// status instead of being hidden behind a plain success message.
+func (m *Monitor) reportOnline(cfg Config, found discovery) {
+	message := "网络正常"
+	if found.primaryFailureKind != "" {
+		message = fmt.Sprintf("网络正常（%s 探测失败：%s，已由 IP 直连探测确认连通）", cfg.ProbeURL, found.primaryFailureKind)
+	}
+	m.logger.Printf("%s", message)
+	m.statuses.set(Status{State: "online", Message: message, LastChecked: time.Now()})
+}
+
+// recoverNetwork applies the cheapest remedy that can plausibly explain the
+// failure it was given. The escalation itself is decided by recoveryFor, which
+// keeps the safety rule — never drop the lease while a default route exists —
+// enforced in one explicit, testable place.
+func (m *Monitor) recoverNetwork(ctx context.Context, cfg Config, failed discovery) discovery {
+	if !networkRecoveryAvailable {
+		return failed
+	}
+
+	switch recoveryFor(failed) {
+	case recoveryFlushDNS:
+		if !flushDNS(ctx) {
+			return failed
+		}
+		m.logger.Printf("网关 %s 可用但域名解析失败，已清理 DNS 缓存并重新探测", failed.gateway)
+		return discoverPortal(ctx, cfg)
+
+	case recoveryRestartDHCP:
+		if !m.dhcp.allow(time.Now(), dhcpRestartCooldown) {
+			m.logger.Printf("未获取到默认网关，但距上次重启 DHCP 不足 %s；跳过本次重启，避免网络反复中断", dhcpRestartCooldown)
+			return failed
+		}
+		m.logger.Printf("未检测到默认网关，执行 ipconfig /release 与 ipconfig /renew")
+		renewCtx, cancel := context.WithTimeout(ctx, dhcpRestartTimeout)
+		err := restartDHCP(renewCtx)
+		cancel()
+		if err != nil {
+			m.logger.Printf("执行 ipconfig /release 与 ipconfig /renew 失败：%v", err)
+			return failed
+		}
+		m.logger.Printf("已执行 ipconfig /release 与 ipconfig /renew，等待网络收敛（最多 %s）", gatewayWaitTimeout)
+		waitCtx, cancel := context.WithTimeout(ctx, gatewayWaitTimeout)
+		gateway, ok := waitForGateway(waitCtx)
+		cancel()
+		if !ok {
+			m.logger.Printf("运行 ipconfig /release 与 ipconfig /renew 后仍未获取到网关")
+			return failed
+		}
+		m.logger.Printf("已重新获取默认网关 %s，重新探测", gateway)
+		return discoverPortal(ctx, cfg)
+	}
+	return failed
+}
+
+// performLogin runs the portal sign-in flow for a discovered portal address.
+func (m *Monitor) performLogin(ctx context.Context, cfg Config, portalURL string) {
+	m.logger.Printf("检测到校园网门户: %s", portalURL)
+	m.statuses.set(Status{State: "logging_in", Message: "检测到门户，正在登录…", LastChecked: time.Now(), PortalURL: portalURL})
 	username, password, err := m.configs.credentials()
 	if err != nil {
 		m.logger.Printf("未尝试登录: %v", err)
-		m.statuses.set(Status{State: "needs_configuration", Message: "请在 WebUI 配置账号和密码", LastChecked: time.Now(), PortalURL: result.portalURL})
+		m.statuses.set(Status{State: "needs_configuration", Message: "请在 WebUI 配置账号和密码", LastChecked: time.Now(), PortalURL: portalURL})
 		return
 	}
 	loginCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	err = m.login.Login(loginCtx, cfg, username, password, result.portalURL)
+	err = m.login.Login(loginCtx, cfg, username, password, portalURL)
 	cancel()
 	if err == nil {
 		m.logger.Printf("已提交登录，正在验证网络状态")
@@ -555,21 +668,21 @@ func (m *Monitor) check(ctx context.Context) {
 		case <-verifyTimer.C:
 		}
 		verifyCtx, verifyCancel := context.WithTimeout(ctx, 12*time.Second)
-		verify, verifyErr := probe(verifyCtx, cfg)
+		verify := discoverPortal(verifyCtx, cfg)
 		verifyCancel()
-		if verifyErr == nil && verify.portalURL == "" {
+		switch {
+		case verify.online:
 			m.logger.Printf("登录成功，网络已恢复")
 			m.statuses.set(Status{State: "online", Message: "登录成功，网络正常", LastChecked: time.Now()})
 			return
-		}
-		if verifyErr != nil {
-			err = fmt.Errorf("登录后的网络验证失败: %w", verifyErr)
-		} else {
+		case verify.captive:
 			err = errors.New("登录后的网络验证仍被重定向至门户")
+		default:
+			err = fmt.Errorf("登录后的网络验证失败：%s", verify.failureKinds())
 		}
 	}
 	m.logger.Printf("登录失败：%v；将在下个探测周期重试", err)
-	m.statuses.set(Status{State: "login_failed", Message: "登录失败，将在下个周期重试：" + err.Error(), LastChecked: time.Now(), PortalURL: result.portalURL})
+	m.statuses.set(Status{State: "login_failed", Message: "登录失败，将在下个周期重试：" + err.Error(), LastChecked: time.Now(), PortalURL: portalURL})
 }
 
 type App struct {
@@ -748,9 +861,11 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		cfg := a.configs.snapshot()
 		writeJSON(w, http.StatusOK, map[string]any{
-			"username": cfg.Username, "has_password": cfg.PasswordEncrypted != "", "probe_url": cfg.ProbeURL,
+			"username": cfg.Username, "has_password": cfg.PasswordEncrypted != "",
+			"service": cfg.Service, "services": portalServices, "probe_url": cfg.ProbeURL,
 			"portal_host": cfg.PortalHost, "probe_expected_text": cfg.ProbeExpectedText,
-			"interval_seconds": cfg.IntervalSeconds, "web_port": cfg.WebPort,
+			"probe_expected_status": cfg.ProbeExpectedStatus,
+			"interval_seconds":      cfg.IntervalSeconds, "web_port": cfg.WebPort,
 		})
 	case http.MethodPut:
 		defer r.Body.Close()
@@ -848,17 +963,17 @@ func executableDir() (string, error) {
 const indexHTML = `<!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>YZU Auto Login</title>
-<style>body{max-width:720px;margin:32px auto;padding:0 16px;font:15px system-ui;color:#172033;background:#f7f8fa}section{background:#fff;border:1px solid #dde2e8;border-radius:10px;padding:20px;margin:16px 0}h1{margin:0 0 4px}h2{font-size:18px}label{display:block;margin:12px 0 4px}input{box-sizing:border-box;width:100%;padding:9px;border:1px solid #bbc4ce;border-radius:6px}button{padding:9px 14px;border:0;border-radius:6px;background:#1769aa;color:#fff;cursor:pointer;margin:16px 8px 0 0}.state{font-weight:600}.hint,#result{color:#56616e;font-size:13px;white-space:pre-wrap}.logs{max-height:260px;overflow:auto;padding:10px;background:#101828;color:#d0d5dd;border-radius:6px;font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap}.danger{color:#b42318}</style>
+<style>body{max-width:720px;margin:32px auto;padding:0 16px;font:15px system-ui;color:#172033;background:#f7f8fa}section{background:#fff;border:1px solid #dde2e8;border-radius:10px;padding:20px;margin:16px 0}h1{margin:0 0 4px}h2{font-size:18px}label{display:block;margin:12px 0 4px}input,select{box-sizing:border-box;width:100%;padding:9px;border:1px solid #bbc4ce;border-radius:6px;background:#fff;color:inherit;font:inherit}button{padding:9px 14px;border:0;border-radius:6px;background:#1769aa;color:#fff;cursor:pointer;margin:16px 8px 0 0}.state{font-weight:600}.hint,#result{color:#56616e;font-size:13px;white-space:pre-wrap}.logs{max-height:260px;overflow:auto;padding:10px;background:#101828;color:#d0d5dd;border-radius:6px;font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap}.danger{color:#b42318}</style>
 <body><h1>YZU Auto Login</h1><div class="hint">仅监听本机。密码以 AES-GCM 加密保存。</div>
 <section><h2>状态</h2><div id="status">正在加载…</div><button onclick="probe()">立即探测</button></section>
-<section><h2>配置</h2><form id="form"><label>账号</label><input id="username" autocomplete="username"><label>密码（留空则保留原密码）</label><input id="password" type="password" autocomplete="new-password"><label><input id="clear" type="checkbox" style="width:auto"> 删除已保存的密码</label><label>探测地址</label><input id="probe_url" type="url"><label>预期探测正文</label><input id="probe_expected_text"><label>门户主机名</label><input id="portal_host"><label>探测间隔（秒，至少 15）</label><input id="interval_seconds" type="number" min="15" max="86400"><button>保存配置</button></form><div id="result"></div></section>
+<section><h2>配置</h2><form id="form"><label>账号</label><input id="username" autocomplete="username"><label>密码（留空则保留原密码）</label><input id="password" type="password" autocomplete="new-password"><label><input id="clear" type="checkbox" style="width:auto"> 删除已保存的密码</label><label>运营商服务</label><select id="service"></select><label>探测地址</label><input id="probe_url" type="url"><label>预期探测正文</label><input id="probe_expected_text"><label>预期状态码（0 表示不校验）</label><input id="probe_expected_status" type="number" min="0" max="599"><label>门户主机名</label><input id="portal_host"><label>探测间隔（秒，至少 15）</label><input id="interval_seconds" type="number" min="15" max="86400"><button>保存配置</button></form><div id="result"></div></section>
 <section><h2>日志</h2><div class="hint">每两秒自动刷新；日志文件同时保存在程序目录的 logs\\app.log。</div><pre id="logs" class="logs">正在加载日志…</pre></section>
 <script>
 const $=id=>document.getElementById(id);const esc=s=>String(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 let configLoaded=false;
-async function loadConfig(force=false){if(configLoaded&&!force)return;let c=await (await fetch('/api/config')).json();['username','probe_url','probe_expected_text','portal_host','interval_seconds'].forEach(k=>$(k).value=c[k]);$('password').placeholder=c.has_password?'已保存（无需重复填写）':'尚未设置';configLoaded=true}
+async function loadConfig(force=false){if(configLoaded&&!force)return;let c=await (await fetch('/api/config')).json();let sel=$('service');if(!sel.options.length)sel.innerHTML=(c.services||[]).map(s=>'<option value="'+esc(s)+'">'+esc(s)+'</option>').join('');['username','service','probe_url','probe_expected_text','probe_expected_status','portal_host','interval_seconds'].forEach(k=>$(k).value=c[k]);$('password').placeholder=c.has_password?'已保存（无需重复填写）':'尚未设置';configLoaded=true}
 async function loadStatus(){let s=await (await fetch('/api/status')).json();$('status').innerHTML='<div class="state">'+esc(s.message)+'</div><div class="hint">状态：'+esc(s.state)+'<br>最后探测：'+(s.last_checked?new Date(s.last_checked).toLocaleString():'尚无')+(s.portal_url?'<br>门户：'+esc(s.portal_url):'')+'</div>'}
 async function loadLogs(){try{let data=await (await fetch('/api/logs')).json(),el=$('logs'),atBottom=el.scrollTop+el.clientHeight>=el.scrollHeight-20;el.textContent=data.entries.map(e=>(e.timestamp?new Date(e.timestamp).toLocaleString()+' ':'')+e.message).join('\n')||'暂无日志';if(atBottom)el.scrollTop=el.scrollHeight}catch{}}
 async function probe(){await fetch('/api/probe',{method:'POST'});setTimeout(loadStatus,500)}
-$('form').onsubmit=async e=>{e.preventDefault();let body={username:$('username').value,password:$('password').value,clear_password:$('clear').checked,probe_url:$('probe_url').value,probe_expected_text:$('probe_expected_text').value,portal_host:$('portal_host').value,interval_seconds:Number($('interval_seconds').value)};let r=await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),x=await r.json();$('result').className=r.ok?'':'danger';$('result').textContent=r.ok?x.message:x.error; if(r.ok){$('password').value='';$('clear').checked=false;await loadConfig(true);loadStatus()}};loadConfig();loadStatus();loadLogs();setInterval(loadStatus,5000);setInterval(loadLogs,2000);
+$('form').onsubmit=async e=>{e.preventDefault();let body={username:$('username').value,password:$('password').value,clear_password:$('clear').checked,service:$('service').value,probe_url:$('probe_url').value,probe_expected_text:$('probe_expected_text').value,probe_expected_status:Number($('probe_expected_status').value)||0,portal_host:$('portal_host').value,interval_seconds:Number($('interval_seconds').value)};let r=await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),x=await r.json();$('result').className=r.ok?'':'danger';$('result').textContent=r.ok?x.message:x.error; if(r.ok){$('password').value='';$('clear').checked=false;await loadConfig(true);loadStatus()}};loadConfig();loadStatus();loadLogs();setInterval(loadStatus,5000);setInterval(loadLogs,2000);
 </script></body></html>`

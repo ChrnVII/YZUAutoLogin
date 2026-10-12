@@ -17,11 +17,48 @@ import (
 	"time"
 )
 
+// portalServices are the carrier services offered on the campus portal's
+// service-selection page, in the order the page lists them. The WebUI renders
+// this list as a dropdown and the chosen value is sent twice: as the eportal
+// preference cookies and as the service field of the loginOfCas request. Both
+// must match the portal's wording exactly, so this list is the single source of
+// truth for the value.
+var portalServices = []string{
+	"联通互联网服务",
+	"移动互联网服务",
+	"电信互联网服务",
+}
+
+// defaultPortalService preserves the behaviour of every earlier build, which
+// always authenticated against the telecom service. A config file written
+// before the selector existed resolves to this value on load.
+const defaultPortalService = "电信互联网服务"
+
 const (
-	yzuServiceName  = "电信互联网服务"
 	browserUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
 	portalReadyWait = 2 * time.Second
 )
+
+// isPortalService reports whether name is one of the services the portal offers.
+func isPortalService(name string) bool {
+	for _, service := range portalServices {
+		if service == name {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeService maps an empty or unrecognized selection onto the default.
+// A blank value must keep the previous telecom behaviour rather than failing
+// every login, which is what makes an older config file load cleanly.
+func normalizeService(name string) string {
+	name = strings.TrimSpace(name)
+	if isPortalService(name) {
+		return name
+	}
+	return defaultPortalService
+}
 
 type yzuPortalLogin struct{}
 
@@ -37,7 +74,10 @@ var (
 	eportalPattern   = regexp.MustCompile(`(?i)https?://[^\s"'<]+/eportal/index\.jsp[^\s"'<]*`)
 )
 
-func (yzuPortalLogin) Login(ctx context.Context, _ Config, username, password, portalURL string) error {
+func (yzuPortalLogin) Login(ctx context.Context, cfg Config, username, password, portalURL string) error {
+	// The carrier service is part of the portal handshake rather than the SSO
+	// exchange, so it has to be resolved before the first eportal request.
+	service := normalizeService(cfg.Service)
 	entryURL, err := url.Parse(portalURL)
 	if err != nil {
 		return fmt.Errorf("门户地址无效: %w", err)
@@ -47,7 +87,7 @@ func (yzuPortalLogin) Login(ctx context.Context, _ Config, username, password, p
 		return err
 	}
 	client := &http.Client{Jar: jar, Timeout: 18 * time.Second}
-	seedPortalServiceCookies(client, entryURL)
+	seedPortalServiceCookies(client, entryURL, service)
 	loginURL, err := resolveSSOLogin(ctx, client, entryURL)
 	if err != nil {
 		return err
@@ -64,14 +104,14 @@ func (yzuPortalLogin) Login(ctx context.Context, _ Config, username, password, p
 	if !strings.Contains(portalPage.Path, "/eportal/") || portalPage.RawQuery == "" {
 		return fmt.Errorf("统一认证没有跳转到校园网门户，当前地址为 %s", portalPage.String())
 	}
-	seedPortalServiceCookies(client, portalPage)
+	seedPortalServiceCookies(client, portalPage, service)
 	if err := initializePortalService(ctx, client, portalPage); err != nil {
 		return err
 	}
 	if err := waitForPortalReady(ctx); err != nil {
 		return err
 	}
-	if err := submitPortalService(ctx, client, portalPage, username); err != nil {
+	if err := submitPortalService(ctx, client, portalPage, username, service); err != nil {
 		return err
 	}
 	return nil
@@ -226,13 +266,14 @@ func submitSSOLogin(ctx context.Context, client *http.Client, loginURL *url.URL,
 
 // seedPortalServiceCookies reproduces the service-selection state that the
 // browser sends to eportal before it calls loginOfCas. These are portal-local
-// preferences, not SSO credentials; their values come from the captured HAR.
-func seedPortalServiceCookies(client *http.Client, portalURL *url.URL) {
+// preferences, not SSO credentials; their values come from the captured HAR,
+// with the service name coming from the WebUI selection.
+func seedPortalServiceCookies(client *http.Client, portalURL *url.URL, service string) {
 	if client == nil || client.Jar == nil || portalURL == nil || !strings.Contains(portalURL.Path, "/eportal/") {
 		return
 	}
 	cookieURL := &url.URL{Scheme: portalURL.Scheme, Host: portalURL.Host, Path: "/"}
-	encodedService := url.QueryEscape(yzuServiceName)
+	encodedService := url.QueryEscape(normalizeService(service))
 	client.Jar.SetCookies(cookieURL, []*http.Cookie{
 		{Name: "EPORTAL_COOKIE_OPERATORPWD", Value: "", Path: "/"},
 		{Name: "EPORTAL_COOKIE_SERVER", Value: encodedService, Path: "/"},
@@ -308,12 +349,13 @@ func callPortalInterface(ctx context.Context, client *http.Client, portalPage *u
 	return nil
 }
 
-func submitPortalService(ctx context.Context, client *http.Client, portalPage *url.URL, username string) error {
+func submitPortalService(ctx context.Context, client *http.Client, portalPage *url.URL, username, service string) error {
 	portalBase := &url.URL{Scheme: portalPage.Scheme, Host: portalPage.Host, Path: "/eportal/InterFace.do"}
 	queryString := portalPage.RawQuery
 	if queryString == "" {
 		return errors.New("校园网门户地址缺少网络会话参数")
 	}
+	selectedService := normalizeService(service)
 	form := url.Values{
 		// The portal JavaScript applies encodeURIComponent twice and writes the
 		// result directly to the request body. Values.Encode supplies the outer
@@ -323,7 +365,7 @@ func submitPortalService(ctx context.Context, client *http.Client, portalPage *u
 		// WEB authentication device.
 		"userId":          {url.QueryEscape(username)},
 		"flag":            {"casauthofservicecheck"},
-		"service":         {url.QueryEscape(yzuServiceName)},
+		"service":         {url.QueryEscape(selectedService)},
 		"queryString":     {url.QueryEscape(queryString)},
 		"operatorPwd":     {""},
 		"operatorUserId":  {""},
@@ -342,22 +384,22 @@ func submitPortalService(ctx context.Context, client *http.Client, portalPage *u
 	req.Header.Set("User-Agent", browserUA)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("提交电信服务认证失败: %w", err)
+		return fmt.Errorf("提交%s认证失败: %w", selectedService, err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
-		return fmt.Errorf("读取电信服务认证响应失败: %w", err)
+		return fmt.Errorf("读取%s认证响应失败: %w", selectedService, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("电信服务认证失败，HTTP %d", resp.StatusCode)
+		return fmt.Errorf("%s认证失败，HTTP %d", selectedService, resp.StatusCode)
 	}
 	if reason, rejected := portalServiceRejection(body); rejected {
 		sessionInfo := portalSessionDiagnostics(client, portalPage)
 		if reason != "" {
-			return fmt.Errorf("电信服务认证被门户拒绝：%s（%s）", reason, sessionInfo)
+			return fmt.Errorf("%s认证被门户拒绝：%s（%s）", selectedService, reason, sessionInfo)
 		}
-		return fmt.Errorf("电信服务认证被门户拒绝（门户未提供文字原因；%s）", sessionInfo)
+		return fmt.Errorf("%s认证被门户拒绝（门户未提供文字原因；%s）", selectedService, sessionInfo)
 	}
 	return nil
 }
