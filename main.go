@@ -644,6 +644,22 @@ func (m *Monitor) recoverNetwork(ctx context.Context, cfg Config, failed discove
 	return failed
 }
 
+const (
+	// loginAttemptTimeout bounds one sign-in submission.
+	loginAttemptTimeout = 20 * time.Second
+	// loginVerifyTimeout bounds the connectivity check that follows a submission.
+	loginVerifyTimeout = 12 * time.Second
+	// loginAttempts is how many times a single probe cycle signs in before
+	// handing the problem to the next tick. One attempt can lose to a TLS
+	// handshake the portal is still gating, and the next tick is a whole probe
+	// interval away, so a single failure must not cost that wait.
+	loginAttempts = 3
+)
+
+// loginRetryDelay spaces repeated sign-in attempts apart. It is a variable
+// rather than a constant so tests can collapse the wait.
+var loginRetryDelay = 3 * time.Second
+
 // performLogin runs the portal sign-in flow for a discovered portal address.
 func (m *Monitor) performLogin(ctx context.Context, cfg Config, portalURL string) {
 	m.logger.Printf("检测到校园网门户: %s", portalURL)
@@ -654,35 +670,67 @@ func (m *Monitor) performLogin(ctx context.Context, cfg Config, portalURL string
 		m.statuses.set(Status{State: "needs_configuration", Message: "请在 WebUI 配置账号和密码", LastChecked: time.Now(), PortalURL: portalURL})
 		return
 	}
-	loginCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	err = m.login.Login(loginCtx, cfg, username, password, portalURL)
-	cancel()
-	if err == nil {
-		m.logger.Printf("已提交登录，正在验证网络状态")
-		m.statuses.set(Status{State: "verifying", Message: "已提交登录，正在验证…", LastChecked: time.Now()})
-		verifyTimer := time.NewTimer(2 * time.Second)
-		select {
-		case <-ctx.Done():
-			verifyTimer.Stop()
-			return
-		case <-verifyTimer.C:
-		}
-		verifyCtx, verifyCancel := context.WithTimeout(ctx, 12*time.Second)
-		verify := discoverPortal(verifyCtx, cfg)
-		verifyCancel()
-		switch {
-		case verify.online:
+
+	for attempt := 1; attempt <= loginAttempts; attempt++ {
+		submitted, attemptErr := m.attemptLogin(ctx, cfg, username, password, portalURL)
+		if attemptErr == nil {
 			m.logger.Printf("登录成功，网络已恢复")
 			m.statuses.set(Status{State: "online", Message: "登录成功，网络正常", LastChecked: time.Now()})
 			return
-		case verify.captive:
-			err = errors.New("登录后的网络验证仍被重定向至门户")
-		default:
-			err = fmt.Errorf("登录后的网络验证失败：%s", verify.failureKinds())
 		}
+		err = attemptErr
+		// A submission that already completed may have created a session, so it
+		// must never be repeated: signing in twice is what the portal rejects as
+		// a duplicate session. Only a request that never finished is retried.
+		if submitted || attempt == loginAttempts || ctx.Err() != nil {
+			break
+		}
+		m.logger.Printf("登录失败（第 %d/%d 次）：%v；%s 后重试", attempt, loginAttempts, err, loginRetryDelay)
+		retryTimer := time.NewTimer(loginRetryDelay)
+		select {
+		case <-ctx.Done():
+			retryTimer.Stop()
+			return
+		case <-retryTimer.C:
+		}
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	m.logger.Printf("登录失败：%v；将在下个探测周期重试", err)
 	m.statuses.set(Status{State: "login_failed", Message: "登录失败，将在下个周期重试：" + err.Error(), LastChecked: time.Now(), PortalURL: portalURL})
+}
+
+// attemptLogin submits the credentials once and verifies the result. A nil error
+// means the portal accepted them and the network is confirmed reachable.
+// submitted distinguishes the two failure classes: false means the request never
+// completed and nothing was authenticated, so the caller may safely retry.
+func (m *Monitor) attemptLogin(ctx context.Context, cfg Config, username, password, portalURL string) (submitted bool, err error) {
+	loginCtx, cancel := context.WithTimeout(ctx, loginAttemptTimeout)
+	defer cancel()
+	if err := m.login.Login(loginCtx, cfg, username, password, portalURL); err != nil {
+		return false, err
+	}
+	m.logger.Printf("已提交登录，正在验证网络状态")
+	m.statuses.set(Status{State: "verifying", Message: "已提交登录，正在验证…", LastChecked: time.Now()})
+	readyTimer := time.NewTimer(portalReadyWait)
+	defer readyTimer.Stop()
+	select {
+	case <-ctx.Done():
+		return true, ctx.Err()
+	case <-readyTimer.C:
+	}
+	verifyCtx, verifyCancel := context.WithTimeout(ctx, loginVerifyTimeout)
+	verify := discoverPortal(verifyCtx, cfg)
+	verifyCancel()
+	switch {
+	case verify.online:
+		return true, nil
+	case verify.captive:
+		return true, errors.New("登录后的网络验证仍被重定向至门户")
+	default:
+		return true, fmt.Errorf("登录后的网络验证失败：%s", verify.failureKinds())
+	}
 }
 
 type App struct {

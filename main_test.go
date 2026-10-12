@@ -929,3 +929,70 @@ func TestDHCPGateThrottlesRestarts(t *testing.T) {
 		t.Fatal("a restart was still refused after the cooldown window")
 	}
 }
+
+// countingLogin fails the way the reported outage did: the request never
+// completes, so nothing was authenticated and the attempt is safe to repeat.
+type countingLogin struct{ calls int }
+
+func (c *countingLogin) Login(context.Context, Config, string, string, string) error {
+	c.calls++
+	return errors.New("net/http: TLS handshake timeout")
+}
+
+// The reported outage: the sign-in submission dies on a TLS handshake the portal
+// is still gating. Waiting a whole probe interval for the next tick left the
+// machine offline for minutes, so one cycle now retries in place.
+func TestPerformLoginRetriesAFailedSubmissionInTheSameCycle(t *testing.T) {
+	previousDelay := loginRetryDelay
+	loginRetryDelay = time.Millisecond
+	t.Cleanup(func() { loginRetryDelay = previousDelay })
+
+	dir := t.TempDir()
+	store, err := newConfigStore(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.update(configUpdate{
+		Username: "student-id", Password: "secret", ProbeURL: "https://example.test/probe",
+		PortalHost: "sso.yzu.edu.cn", IntervalSeconds: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	logger, err := newLogger(filepath.Join(dir, "app.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	fake := &countingLogin{}
+	monitor := &Monitor{configs: store, logger: logger, statuses: &statusStore{}, login: fake}
+	monitor.performLogin(context.Background(), store.snapshot(), "http://10.0.0.1/eportal/index.jsp?wlanuserip=1")
+
+	if fake.calls != loginAttempts {
+		t.Fatalf("a submission that never completed was tried %d times, want %d", fake.calls, loginAttempts)
+	}
+	if got := monitor.statuses.get().State; got != "login_failed" {
+		t.Fatalf("unexpected status once the retries were exhausted: %q", got)
+	}
+}
+
+// The default transport gives up a TLS handshake after ten seconds, which is
+// what produced "TLS handshake timeout" while the portal was still gating
+// traffic.
+func TestPortalHTTPClientRaisesTheTLSHandshakeCeiling(t *testing.T) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := portalHTTPClient(jar)
+	if client.Jar != jar {
+		t.Fatal("the sign-in client dropped the cookie jar the flow depends on")
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("unexpected transport type: %T", client.Transport)
+	}
+	if transport.TLSHandshakeTimeout <= 10*time.Second {
+		t.Fatalf("the TLS handshake ceiling was not raised above the 10s default: %s", transport.TLSHandshakeTimeout)
+	}
+}

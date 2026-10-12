@@ -37,6 +37,14 @@ const defaultPortalService = "电信互联网服务"
 const (
 	browserUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
 	portalReadyWait = 2 * time.Second
+	// portalTLSHandshakeTimeout replaces the transport default of 10 seconds.
+	// While the machine is still unauthenticated the portal frequently holds the
+	// TLS handshake to the SSO host open, and the login was abandoned with
+	// "net/http: TLS handshake timeout" even though a retry seconds later
+	// succeeded.
+	portalTLSHandshakeTimeout = 20 * time.Second
+	// portalRequestTimeout bounds one request of the sign-in flow.
+	portalRequestTimeout = 18 * time.Second
 )
 
 // isPortalService reports whether name is one of the services the portal offers.
@@ -86,7 +94,7 @@ func (yzuPortalLogin) Login(ctx context.Context, cfg Config, username, password,
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Jar: jar, Timeout: 18 * time.Second}
+	client := portalHTTPClient(jar)
 	seedPortalServiceCookies(client, entryURL, service)
 	loginURL, err := resolveSSOLogin(ctx, client, entryURL)
 	if err != nil {
@@ -115,6 +123,23 @@ func (yzuPortalLogin) Login(ctx context.Context, cfg Config, username, password,
 		return err
 	}
 	return nil
+}
+
+// portalHTTPClient builds the client that carries the whole sign-in flow. One
+// client serves the redirect chain, the SSO page and the eportal calls, so the
+// cookie jar and the connection pool stay shared across all of them.
+//
+// It exists for one reason: the default transport abandons a TLS handshake after
+// ten seconds. While the machine is unauthenticated the portal routinely holds
+// the handshake to the SSO host open for longer, which surfaced as
+// "net/http: TLS handshake timeout" and left the machine signing in again only
+// on the next probe tick — minutes later at a typical interval. Only that
+// ceiling is raised here; the rest of the default transport, proxy support
+// included, is kept as it was.
+func portalHTTPClient(jar http.CookieJar) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSHandshakeTimeout = portalTLSHandshakeTimeout
+	return &http.Client{Jar: jar, Transport: transport, Timeout: portalRequestTimeout}
 }
 
 func resolveSSOLogin(ctx context.Context, client *http.Client, entryURL *url.URL) (*url.URL, error) {
